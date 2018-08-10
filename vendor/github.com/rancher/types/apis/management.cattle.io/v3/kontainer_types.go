@@ -36,4 +36,5 @@ type KontainerDriverSpec struct {
 	Checksum    string `json:"checksum"`
 	DesiredPort int    `json:"desiredPort" norman:"required"`
 	ActualPort  int    `json:"actualPort"`
+	BuiltIn     bool   `json:"builtIn"`
 }

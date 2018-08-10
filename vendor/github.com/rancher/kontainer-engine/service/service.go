@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -50,11 +51,11 @@ func RegisterDriverForPort(name string, driver types.Driver, port int) {
 	logrus.Infof("Activating driver %s done", name)
 }
 
-func RegisterAddressOnly(name string, address string) {
+func RegisterExternalDriver(name string, address string) {
 	pluginAddress[name] = address
 }
 
-func DeregisterAddressOnly(name string) {
+func DeregisterExternalDriver(name string) {
 	delete(pluginAddress, name)
 }
 
@@ -73,35 +74,8 @@ func (c controllerConfigGetter) GetConfig() (types.DriverOptions, error) {
 	}
 	data := map[string]interface{}{}
 	switch c.driverName {
-	case "gke":
-		config, err := toMap(c.clusterSpec.GoogleKubernetesEngineConfig, "json")
-		if err != nil {
-			return driverOptions, err
-		}
-		data = config
-		flatten(data, &driverOptions)
-	case "rke":
-		config, err := yaml.Marshal(c.clusterSpec.RancherKubernetesEngineConfig)
-		if err != nil {
-			return driverOptions, err
-		}
-		driverOptions.StringOptions["rkeConfig"] = string(config)
-	case "aks":
-		config, err := toMap(c.clusterSpec.AzureKubernetesServiceConfig, "json")
-		if err != nil {
-			return driverOptions, err
-		}
-		data = config
-		flatten(data, &driverOptions)
 	case "import":
 		config, err := toMap(c.clusterSpec.ImportedConfig, "json")
-		if err != nil {
-			return driverOptions, err
-		}
-		data = config
-		flatten(data, &driverOptions)
-	case "eks":
-		config, err := toMap(c.clusterSpec.AmazonElasticContainerServiceConfig, "json")
 		if err != nil {
 			return driverOptions, err
 		}
@@ -136,6 +110,21 @@ func flatten(data map[string]interface{}, driverOptions *types.DriverOptions) {
 			driverOptions.StringOptions[k] = v.(string)
 		case bool:
 			driverOptions.BoolOptions[k] = v.(bool)
+		case []interface{}:
+			// lists of strings come across as lists of interfaces, have to convert them manually
+			var stringArray []string
+
+			for _, stringInterface := range v.([]interface{}) {
+				switch stringInterface.(type) {
+				case string:
+					stringArray = append(stringArray, stringInterface.(string))
+				}
+			}
+
+			// if the length is 0 then it must not have been an array of strings
+			if len(stringArray) != 0 {
+				driverOptions.StringSliceOptions[k] = &types.StringSlice{Value: stringArray}
+			}
 		case []string:
 			driverOptions.StringSliceOptions[k] = &types.StringSlice{Value: v.([]string)}
 		case map[string]interface{}:
@@ -149,6 +138,8 @@ func flatten(data map[string]interface{}, driverOptions *types.DriverOptions) {
 			} else {
 				flatten(v.(map[string]interface{}), driverOptions)
 			}
+		default:
+			logrus.Warnf("could not convert %v %v=%v", reflect.TypeOf(v), k, v)
 		}
 	}
 }
@@ -182,6 +173,8 @@ type EngineService interface {
 	Create(ctx context.Context, name string, clusterSpec v3.ClusterSpec) (string, string, string, error)
 	Update(ctx context.Context, name string, clusterSpec v3.ClusterSpec) (string, string, string, error)
 	Remove(ctx context.Context, name string, clusterSpec v3.ClusterSpec) error
+	GetDriverCreateOptions(ctx context.Context, name string, clusterSpec v3.ClusterSpec) (*types.DriverFlags, error)
+	GetDriverUpdateOptions(ctx context.Context, name string, clusterSpec v3.ClusterSpec) (*types.DriverFlags, error)
 }
 
 type engineService struct {
@@ -197,18 +190,10 @@ func NewEngineService(store cluster.PersistentStore) EngineService {
 func (e *engineService) convertCluster(name string, spec v3.ClusterSpec) (cluster.Cluster, error) {
 	// todo: decide whether we need a driver field
 	driverName := ""
-	if spec.AzureKubernetesServiceConfig != nil {
-		driverName = "aks"
-	} else if spec.GoogleKubernetesEngineConfig != nil {
-		driverName = "gke"
-	} else if spec.RancherKubernetesEngineConfig != nil {
-		driverName = "rke"
-	} else if spec.AmazonElasticContainerServiceConfig != nil {
-		driverName = "eks"
-	} else if spec.ImportedConfig != nil {
+	if spec.ImportedConfig != nil {
 		driverName = "import"
 	} else if spec.GenericEngineConfig != nil {
-		driverName = (*spec.GenericEngineConfig).Config["driverName"]
+		driverName = (*spec.GenericEngineConfig)["driverName"].(string)
 		if driverName == "" {
 			return cluster.Cluster{}, fmt.Errorf("no driver name supplied")
 		}
@@ -268,4 +253,24 @@ func (e *engineService) Remove(ctx context.Context, name string, clusterSpec v3.
 		return err
 	}
 	return cls.Remove(ctx)
+}
+
+func (e *engineService) GetDriverCreateOptions(ctx context.Context, name string, clusterSpec v3.ClusterSpec) (*types.DriverFlags,
+	error) {
+	cls, err := e.convertCluster(name, clusterSpec)
+	if err != nil {
+		return nil, err
+	}
+
+	return cls.GetDriverCreateOptions(ctx)
+}
+
+func (e *engineService) GetDriverUpdateOptions(ctx context.Context, name string, clusterSpec v3.ClusterSpec) (*types.DriverFlags,
+	error) {
+	cls, err := e.convertCluster(name, clusterSpec)
+	if err != nil {
+		return nil, err
+	}
+
+	return cls.GetDriverUpdateOptions(ctx)
 }

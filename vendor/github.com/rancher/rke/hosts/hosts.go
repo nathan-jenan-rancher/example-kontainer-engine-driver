@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"path"
+	"strings"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
+	"github.com/sirupsen/logrus"
 
 	"github.com/docker/docker/client"
 	"github.com/rancher/rke/docker"
@@ -35,17 +37,27 @@ type Host struct {
 	DockerInfo          types.Info
 	UpdateWorker        bool
 	PrefixPath          string
+	BastionHost         v3.BastionHost
 }
 
 const (
-	ToCleanEtcdDir       = "/var/lib/etcd"
-	ToCleanSSLDir        = "/etc/kubernetes"
-	ToCleanCNIConf       = "/etc/cni"
-	ToCleanCNIBin        = "/opt/cni"
-	ToCleanCNILib        = "/var/lib/cni"
-	ToCleanCalicoRun     = "/var/run/calico"
-	ToCleanTempCertPath  = "/etc/kubernetes/.tmp/"
-	CleanerContainerName = "kube-cleaner"
+	ToCleanEtcdDir          = "/var/lib/etcd/"
+	ToCleanSSLDir           = "/etc/kubernetes/"
+	ToCleanCNIConf          = "/etc/cni/"
+	ToCleanCNIBin           = "/opt/cni/"
+	ToCleanCNILib           = "/var/lib/cni/"
+	ToCleanCalicoRun        = "/var/run/calico/"
+	ToCleanTempCertPath     = "/etc/kubernetes/.tmp/"
+	CleanerContainerName    = "kube-cleaner"
+	LogCleanerContainerName = "rke-log-cleaner"
+	RKELogsPath             = "/var/lib/rancher/rke/log"
+
+	B2DOS            = "Boot2Docker"
+	B2DPrefixPath    = "/mnt/sda1/rke"
+	ROS              = "RancherOS"
+	ROSPrefixPath    = "/opt/rke"
+	CoreOS           = "CoreOS"
+	CoreOSPrefixPath = "/opt/rke"
 )
 
 func (h *Host) CleanUpAll(ctx context.Context, cleanerImage string, prsMap map[string]v3.PrivateRegistry, externalEtcd bool) error {
@@ -58,6 +70,7 @@ func (h *Host) CleanUpAll(ctx context.Context, cleanerImage string, prsMap map[s
 		path.Join(h.PrefixPath, ToCleanTempCertPath),
 		path.Join(h.PrefixPath, ToCleanCNILib),
 	}
+
 	if !externalEtcd {
 		toCleanPaths = append(toCleanPaths, path.Join(h.PrefixPath, ToCleanEtcdDir))
 	}
@@ -116,12 +129,16 @@ func (h *Host) CleanUp(ctx context.Context, toCleanPaths []string, cleanerImage 
 		return err
 	}
 
-	if err := docker.WaitForContainer(ctx, h.DClient, h.Address, CleanerContainerName); err != nil {
+	if _, err := docker.WaitForContainer(ctx, h.DClient, h.Address, CleanerContainerName); err != nil {
 		return err
 	}
 
 	log.Infof(ctx, "[hosts] Removing cleaner container on host [%s]", h.Address)
 	if err := docker.RemoveContainer(ctx, h.DClient, h.Address, CleanerContainerName); err != nil {
+		return err
+	}
+	log.Infof(ctx, "[hosts] Removing dead container logs on host [%s]", h.Address)
+	if err := DoRunLogCleaner(ctx, h, cleanerImage, prsMap); err != nil {
 		return err
 	}
 	log.Infof(ctx, "[hosts] Successfully cleaned up host [%s]", h.Address)
@@ -280,4 +297,51 @@ func GetUniqueHostList(etcdHosts, cpHosts, workerHosts []*Host) []*Host {
 		uniqHostList = append(uniqHostList, host)
 	}
 	return uniqHostList
+}
+
+func GetPrefixPath(osType, ClusterPrefixPath string) string {
+	var prefixPath string
+	switch {
+	case ClusterPrefixPath != "/":
+		prefixPath = ClusterPrefixPath
+	case strings.Contains(osType, B2DOS):
+		prefixPath = B2DPrefixPath
+	case strings.Contains(osType, ROS):
+		prefixPath = ROSPrefixPath
+	case strings.Contains(osType, CoreOS):
+		prefixPath = CoreOSPrefixPath
+	default:
+		prefixPath = ClusterPrefixPath
+	}
+	return prefixPath
+}
+
+func DoRunLogCleaner(ctx context.Context, host *Host, alpineImage string, prsMap map[string]v3.PrivateRegistry) error {
+	logrus.Debugf("[cleanup] Starting log link cleanup on host [%s]", host.Address)
+	imageCfg := &container.Config{
+		Image: alpineImage,
+		Tty:   true,
+		Cmd: []string{
+			"sh",
+			"-c",
+			fmt.Sprintf("find %s -type l ! -exec test -e {} \\; -print -delete", RKELogsPath),
+		},
+	}
+	hostCfg := &container.HostConfig{
+		Binds: []string{
+			"/var/lib:/var/lib",
+		},
+		Privileged: true,
+	}
+	if err := docker.DoRemoveContainer(ctx, host.DClient, LogCleanerContainerName, host.Address); err != nil {
+		return err
+	}
+	if err := docker.DoRunContainer(ctx, host.DClient, imageCfg, hostCfg, LogCleanerContainerName, host.Address, "cleanup", prsMap); err != nil {
+		return err
+	}
+	if err := docker.DoRemoveContainer(ctx, host.DClient, LogCleanerContainerName, host.Address); err != nil {
+		return err
+	}
+	logrus.Debugf("[cleanup] Successfully cleaned up log links on host [%s]", host.Address)
+	return nil
 }

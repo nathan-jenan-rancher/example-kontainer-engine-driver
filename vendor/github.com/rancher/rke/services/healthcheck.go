@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rancher/rke/docker"
 	"github.com/rancher/rke/hosts"
 	"github.com/rancher/rke/log"
 	"github.com/rancher/rke/pki"
@@ -50,7 +51,7 @@ func runHealthcheck(ctx context.Context, host *hosts.Host, serviceName string, l
 	}
 	client, err := getHealthCheckHTTPClient(host, port, localConnDialerFactory, &x509Pair)
 	if err != nil {
-		return fmt.Errorf("Failed to initiate new HTTP client for service [%s] for host [%s]", serviceName, host.Address)
+		return fmt.Errorf("Failed to initiate new HTTP client for service [%s] for host [%s]: %v", serviceName, host.Address, err)
 	}
 	for retries := 0; retries < 10; retries++ {
 		if err = getHealthz(client, serviceName, host.Address, url); err != nil {
@@ -61,7 +62,13 @@ func runHealthcheck(ctx context.Context, host *hosts.Host, serviceName string, l
 		log.Infof(ctx, "[healthcheck] service [%s] on host [%s] is healthy", serviceName, host.Address)
 		return nil
 	}
-	return fmt.Errorf("Failed to verify healthcheck: %v", err)
+	logrus.Debug("Checking container logs")
+	containerLog, logserr := docker.GetContainerLogsStdoutStderr(ctx, host.DClient, serviceName, "1", false)
+	containerLog = strings.TrimSuffix(containerLog, "\n")
+	if logserr != nil {
+		return fmt.Errorf("Failed to verify healthcheck for service [%s]: %v", serviceName, logserr)
+	}
+	return fmt.Errorf("Failed to verify healthcheck: %v, log: %v", err, containerLog)
 }
 
 func getHealthCheckHTTPClient(host *hosts.Host, port int, localConnDialerFactory hosts.DialerFactory, x509KeyPair *tls.Certificate) (*http.Client, error) {

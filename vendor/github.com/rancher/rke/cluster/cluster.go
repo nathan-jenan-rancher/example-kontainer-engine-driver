@@ -2,13 +2,12 @@ package cluster
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net"
-	"strconv"
 	"strings"
 
 	"github.com/rancher/rke/authz"
+	"github.com/rancher/rke/cloudprovider"
 	"github.com/rancher/rke/docker"
 	"github.com/rancher/rke/hosts"
 	"github.com/rancher/rke/k8s"
@@ -59,8 +58,6 @@ const (
 	LocalNodeHostname          = "localhost"
 	LocalNodeUser              = "root"
 	CloudProvider              = "CloudProvider"
-	AzureCloudProvider         = "azure"
-	AWSCloudProvider           = "aws"
 	ControlPlane               = "controlPlane"
 	WorkerPlane                = "workerPlan"
 	EtcdPlane                  = "etcd"
@@ -77,7 +74,12 @@ func (c *Cluster) DeployControlPlane(ctx context.Context) error {
 	if len(c.Services.Etcd.ExternalURLs) > 0 {
 		log.Infof(ctx, "[etcd] External etcd connection string has been specified, skipping etcd plane")
 	} else {
-		if err := services.RunEtcdPlane(ctx, c.EtcdHosts, etcdNodePlanMap, c.LocalConnDialerFactory, c.PrivateRegistriesMap, c.UpdateWorkersOnly, c.SystemImages.Alpine); err != nil {
+		etcdRollingSnapshot := services.EtcdSnapshot{
+			Snapshot:  c.Services.Etcd.Snapshot,
+			Creation:  c.Services.Etcd.Creation,
+			Retention: c.Services.Etcd.Retention,
+		}
+		if err := services.RunEtcdPlane(ctx, c.EtcdHosts, etcdNodePlanMap, c.LocalConnDialerFactory, c.PrivateRegistriesMap, c.UpdateWorkersOnly, c.SystemImages.Alpine, etcdRollingSnapshot); err != nil {
 			return fmt.Errorf("[etcd] Failed to bring up Etcd Plane: %v", err)
 		}
 	}
@@ -175,10 +177,29 @@ func ParseCluster(
 		}
 		c.PrivateRegistriesMap[pr.URL] = pr
 	}
-	// parse the cluster config file
-	c.CloudConfigFile, err = c.parseCloudConfig(ctx)
+	// Get Cloud Provider
+	p, err := cloudprovider.InitCloudProvider(c.CloudProvider)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to parse cloud config file: %v", err)
+		return nil, fmt.Errorf("Failed to initialize cloud provider: %v", err)
+	}
+	if p != nil {
+		c.CloudConfigFile, err = p.GenerateCloudConfigFile()
+		if err != nil {
+			return nil, fmt.Errorf("Failed to parse cloud config file: %v", err)
+		}
+		c.CloudProvider.Name = p.GetName()
+		if c.CloudProvider.Name == "" {
+			return nil, fmt.Errorf("Name of the cloud provider is not defined for custom provider")
+		}
+	}
+
+	// Create k8s wrap transport for bastion host
+	if len(c.BastionHost.Address) > 0 {
+		var err error
+		c.K8sWrapTransport, err = hosts.BastionHostWrapTransport(c.BastionHost)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return c, nil
 }
@@ -284,7 +305,14 @@ func (c *Cluster) deployAddons(ctx context.Context) error {
 	if err := c.deployK8sAddOns(ctx); err != nil {
 		return err
 	}
-	return c.deployUserAddOns(ctx)
+	if err := c.deployUserAddOns(ctx); err != nil {
+		if err, ok := err.(*addonError); ok && err.isCritical {
+			return err
+		}
+		log.Warnf(ctx, "Failed to deploy addon execute job [%s]: %v", UserAddonsIncludeResourceName, err)
+
+	}
+	return nil
 }
 
 func (c *Cluster) SyncLabelsAndTaints(ctx context.Context) error {
@@ -344,53 +372,14 @@ func ConfigureCluster(
 	if len(kubeCluster.ControlPlaneHosts) > 0 {
 		kubeCluster.Certificates = crtBundle
 		if err := kubeCluster.deployNetworkPlugin(ctx); err != nil {
+			if err, ok := err.(*addonError); ok && err.isCritical {
+				return err
+			}
+			log.Warnf(ctx, "Failed to deploy addon execute job [%s]: %v", NetworkPluginResourceName, err)
+		}
+		if err := kubeCluster.deployAddons(ctx); err != nil {
 			return err
 		}
-		return kubeCluster.deployAddons(ctx)
 	}
 	return nil
-}
-
-func (c *Cluster) parseCloudConfig(ctx context.Context) (string, error) {
-	// check for azure cloud provider
-	if c.CloudProvider.AzureCloudProvider != nil {
-		c.CloudProvider.Name = AzureCloudProvider
-		jsonString, err := json.MarshalIndent(c.CloudProvider.AzureCloudProvider, "", "\n")
-		if err != nil {
-			return "", err
-		}
-		return string(jsonString), nil
-	}
-	if c.CloudProvider.AWSCloudProvider != nil {
-		c.CloudProvider.Name = AWSCloudProvider
-		return "", nil
-	}
-	if len(c.CloudProvider.CloudConfig) == 0 {
-		return "", nil
-	}
-	// handle generic cloud config
-	tmpMap := make(map[string]interface{})
-	for key, value := range c.CloudProvider.CloudConfig {
-		tmpBool, err := strconv.ParseBool(value)
-		if err == nil {
-			tmpMap[key] = tmpBool
-			continue
-		}
-		tmpInt, err := strconv.ParseInt(value, 10, 64)
-		if err == nil {
-			tmpMap[key] = tmpInt
-			continue
-		}
-		tmpFloat, err := strconv.ParseFloat(value, 64)
-		if err == nil {
-			tmpMap[key] = tmpFloat
-			continue
-		}
-		tmpMap[key] = value
-	}
-	jsonString, err := json.MarshalIndent(tmpMap, "", "\n")
-	if err != nil {
-		return "", err
-	}
-	return string(jsonString), nil
 }

@@ -117,7 +117,7 @@ data:
      "plugins": [
        {
          "type": "calico",
-         "log_level": "info",
+         "log_level": "WARNING",
          "datastore_type": "kubernetes",
          "nodename": "__KUBERNETES_NODE_NAME__",
          "mtu": 1500,
@@ -183,8 +183,9 @@ spec:
           operator: Exists
         - effect: NoExecute
           operator: Exists
-        - key: "node-role.kubernetes.io/master"
+        - key: "node-role.kubernetes.io/controlplane"
           operator: "Exists"
+          effect: "NoSchedule"
         - key: "node-role.kubernetes.io/etcd"
           operator: "Exists"
           effect: "NoExecute"
@@ -200,9 +201,15 @@ spec:
             # Use Kubernetes API as the backing datastore.
             - name: DATASTORE_TYPE
               value: "kubernetes"
-            # Enable felix info logging.
+            # Disable felix logging to file
+            - name: FELIX_LOGFILEPATH
+              value: "none"
+            # Disable felix logging for syslog
+            - name: FELIX_LOGSEVERITYSYS
+              value: ""
+            # Enable felix logging to stdout
             - name: FELIX_LOGSEVERITYSCREEN
-              value: "info"
+              value: "Warning"
             # Cluster type to identify the deployment type
             - name: CLUSTER_TYPE
               value: "k8s,bgp"
@@ -324,7 +331,6 @@ spec:
 ---
 
 apiVersion: apiextensions.k8s.io/v1beta1
-description: Calico Felix Configuration
 kind: CustomResourceDefinition
 metadata:
    name: felixconfigurations.crd.projectcalico.org
@@ -339,7 +345,6 @@ spec:
 
 ---
 apiVersion: apiextensions.k8s.io/v1beta1
-description: Calico BGP Peers
 kind: CustomResourceDefinition
 metadata:
   name: bgppeers.crd.projectcalico.org
@@ -355,7 +360,6 @@ spec:
 ---
 
 apiVersion: apiextensions.k8s.io/v1beta1
-description: Calico BGP Configuration
 kind: CustomResourceDefinition
 metadata:
   name: bgpconfigurations.crd.projectcalico.org
@@ -371,7 +375,6 @@ spec:
 ---
 
 apiVersion: apiextensions.k8s.io/v1beta1
-description: Calico IP Pools
 kind: CustomResourceDefinition
 metadata:
   name: ippools.crd.projectcalico.org
@@ -387,7 +390,6 @@ spec:
 ---
 
 apiVersion: apiextensions.k8s.io/v1beta1
-description: Calico HostEndpoints
 kind: CustomResourceDefinition
 metadata:
   name: hostendpoints.crd.projectcalico.org
@@ -403,7 +405,6 @@ spec:
 ---
 
 apiVersion: apiextensions.k8s.io/v1beta1
-description: Calico Cluster Information
 kind: CustomResourceDefinition
 metadata:
   name: clusterinformations.crd.projectcalico.org
@@ -419,7 +420,6 @@ spec:
 ---
 
 apiVersion: apiextensions.k8s.io/v1beta1
-description: Calico Global Network Policies
 kind: CustomResourceDefinition
 metadata:
   name: globalnetworkpolicies.crd.projectcalico.org
@@ -435,7 +435,6 @@ spec:
 ---
 
 apiVersion: apiextensions.k8s.io/v1beta1
-description: Calico Global Network Sets
 kind: CustomResourceDefinition
 metadata:
   name: globalnetworksets.crd.projectcalico.org
@@ -451,7 +450,6 @@ spec:
 ---
 
 apiVersion: apiextensions.k8s.io/v1beta1
-description: Calico Network Policies
 kind: CustomResourceDefinition
 metadata:
   name: networkpolicies.crd.projectcalico.org

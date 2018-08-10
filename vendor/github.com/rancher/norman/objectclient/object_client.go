@@ -2,6 +2,7 @@ package objectclient
 
 import (
 	"encoding/json"
+	"strings"
 
 	"github.com/pkg/errors"
 	"github.com/rancher/norman/restwatch"
@@ -11,10 +12,13 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	json2 "k8s.io/apimachinery/pkg/runtime/serializer/json"
+	"k8s.io/apimachinery/pkg/runtime/serializer/streaming"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
+	restclientwatch "k8s.io/client-go/rest/watch"
 )
 
 type ObjectFactory interface {
@@ -103,6 +107,7 @@ func (p *ObjectClient) Create(o runtime.Object) (runtime.Object, error) {
 		}
 	}
 	result := p.Factory.Object()
+	logrus.Debugf("REST CREATE %s/%s/%s/%s/%s", p.getAPIPrefix(), p.gvk.Group, p.gvk.Version, ns, p.resource.Name)
 	err := p.restClient.Post().
 		Prefix(p.getAPIPrefix(), p.gvk.Group, p.gvk.Version).
 		NamespaceIfScoped(ns, p.resource.Namespaced).
@@ -126,6 +131,7 @@ func (p *ObjectClient) GetNamespaced(namespace, name string, opts metav1.GetOpti
 		Name(name).
 		Do().
 		Into(result)
+	logrus.Debugf("REST GET %s/%s/%s/%s/%s/%s", p.getAPIPrefix(), p.gvk.Group, p.gvk.Version, namespace, p.resource.Name, name)
 	return result, err
 
 }
@@ -140,6 +146,7 @@ func (p *ObjectClient) Get(name string, opts metav1.GetOptions) (runtime.Object,
 		Name(name).
 		Do().
 		Into(result)
+	logrus.Debugf("REST GET %s/%s/%s/%s/%s/%s", p.getAPIPrefix(), p.gvk.Group, p.gvk.Version, p.ns, p.resource.Name, name)
 	return result, err
 }
 
@@ -152,7 +159,7 @@ func (p *ObjectClient) Update(name string, o runtime.Object) (runtime.Object, er
 	if len(name) == 0 {
 		return result, errors.New("object missing name")
 	}
-	logrus.Debugf("UPDATE %s/%s/%s/%s/%s/%s", p.getAPIPrefix(), p.gvk.Group, p.gvk.Version, ns, p.resource.Name, name)
+	logrus.Debugf("REST UPDATE %s/%s/%s/%s/%s/%s", p.getAPIPrefix(), p.gvk.Group, p.gvk.Version, ns, p.resource.Name, name)
 	err := p.restClient.Put().
 		Prefix(p.getAPIPrefix(), p.gvk.Group, p.gvk.Version).
 		NamespaceIfScoped(ns, p.resource.Namespaced).
@@ -170,6 +177,7 @@ func (p *ObjectClient) DeleteNamespaced(namespace, name string, opts *metav1.Del
 	if namespace != "" {
 		req = req.Namespace(namespace)
 	}
+	logrus.Debugf("REST DELETE %s/%s/%s/%s/%s/%s", p.getAPIPrefix(), p.gvk.Group, p.gvk.Version, namespace, p.resource.Name, name)
 	return req.Resource(p.resource.Name).
 		Name(name).
 		Body(opts).
@@ -178,6 +186,7 @@ func (p *ObjectClient) DeleteNamespaced(namespace, name string, opts *metav1.Del
 }
 
 func (p *ObjectClient) Delete(name string, opts *metav1.DeleteOptions) error {
+	logrus.Debugf("REST DELETE %s/%s/%s/%s/%s/%s", p.getAPIPrefix(), p.gvk.Group, p.gvk.Version, p.ns, p.resource.Name, name)
 	return p.restClient.Delete().
 		Prefix(p.getAPIPrefix(), p.gvk.Group, p.gvk.Version).
 		NamespaceIfScoped(p.ns, p.resource.Namespaced).
@@ -190,6 +199,7 @@ func (p *ObjectClient) Delete(name string, opts *metav1.DeleteOptions) error {
 
 func (p *ObjectClient) List(opts metav1.ListOptions) (runtime.Object, error) {
 	result := p.Factory.List()
+	logrus.Debugf("REST LIST %s/%s/%s/%s/%s", p.getAPIPrefix(), p.gvk.Group, p.gvk.Version, p.ns, p.resource.Name)
 	return result, p.restClient.Get().
 		Prefix(p.getAPIPrefix(), p.gvk.Group, p.gvk.Version).
 		NamespaceIfScoped(p.ns, p.resource.Namespaced).
@@ -215,11 +225,38 @@ func (p *ObjectClient) Watch(opts metav1.ListOptions) (watch.Interface, error) {
 	if err != nil {
 		return nil, err
 	}
-	return watch.NewStreamWatcher(&dynamicDecoder{
+
+	embeddedDecoder := &structuredDecoder{
 		factory: p.Factory,
-		dec:     json.NewDecoder(r),
-		close:   r.Close,
-	}), nil
+	}
+	streamDecoder := streaming.NewDecoder(json2.Framer.NewFrameReader(r), embeddedDecoder)
+	decoder := restclientwatch.NewDecoder(streamDecoder, embeddedDecoder)
+	return watch.NewStreamWatcher(decoder), nil
+}
+
+type structuredDecoder struct {
+	factory ObjectFactory
+}
+
+func (d *structuredDecoder) Decode(data []byte, defaults *schema.GroupVersionKind, into runtime.Object) (runtime.Object, *schema.GroupVersionKind, error) {
+	if into == nil {
+		into = d.factory.Object()
+	}
+
+	err := json.Unmarshal(data, &into)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if _, ok := into.(*metav1.Status); !ok && strings.ToLower(into.GetObjectKind().GroupVersionKind().Kind) == "status" {
+		into = &metav1.Status{}
+		err := json.Unmarshal(data, into)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
+	return into, defaults, err
 }
 
 func (p *ObjectClient) DeleteCollection(deleteOptions *metav1.DeleteOptions, listOptions metav1.ListOptions) error {
@@ -256,41 +293,4 @@ func (p *ObjectClient) Patch(name string, o runtime.Object, data []byte, subreso
 
 func (p *ObjectClient) ObjectFactory() ObjectFactory {
 	return p.Factory
-}
-
-type dynamicDecoder struct {
-	factory ObjectFactory
-	dec     *json.Decoder
-	close   func() error
-}
-
-func (d *dynamicDecoder) Close() {
-	d.close()
-}
-
-func (d *dynamicDecoder) Decode() (action watch.EventType, object runtime.Object, err error) {
-	e := dynamicEvent{
-		Object: holder{
-			factory: d.factory,
-		},
-	}
-	if err := d.dec.Decode(&e); err != nil {
-		return watch.Error, nil, err
-	}
-	return e.Type, e.Object.obj, nil
-}
-
-type dynamicEvent struct {
-	Type   watch.EventType
-	Object holder
-}
-
-type holder struct {
-	factory ObjectFactory
-	obj     runtime.Object
-}
-
-func (h *holder) UnmarshalJSON(b []byte) error {
-	h.obj = h.factory.Object()
-	return json.Unmarshal(b, h.obj)
 }

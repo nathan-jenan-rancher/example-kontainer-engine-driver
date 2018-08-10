@@ -11,6 +11,7 @@ import (
 	"github.com/rancher/rke/k8s"
 	"github.com/rancher/rke/log"
 	"github.com/rancher/rke/pki"
+	"github.com/rancher/rke/services"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 	"k8s.io/client-go/kubernetes"
@@ -22,6 +23,14 @@ func SetUpAuthentication(ctx context.Context, kubeCluster, currentCluster *Clust
 		var err error
 		if currentCluster != nil {
 			kubeCluster.Certificates = currentCluster.Certificates
+			// this is the case of handling upgrades for API server aggregation layer ca cert and API server proxy client key and cert
+			if kubeCluster.Certificates[pki.RequestHeaderCACertName].Certificate == nil {
+
+				kubeCluster.Certificates, err = regenerateAPIAggregationCerts(kubeCluster, kubeCluster.Certificates)
+				if err != nil {
+					return fmt.Errorf("Failed to regenerate Aggregation layer certificates %v", err)
+				}
+			}
 		} else {
 			var backupPlane string
 			var backupHosts []*hosts.Host
@@ -29,8 +38,9 @@ func SetUpAuthentication(ctx context.Context, kubeCluster, currentCluster *Clust
 				backupPlane = ControlPlane
 				backupHosts = kubeCluster.ControlPlaneHosts
 			} else {
-				backupPlane = EtcdPlane
-				backupHosts = kubeCluster.EtcdHosts
+				// Save certificates on etcd and controlplane hosts
+				backupPlane = fmt.Sprintf("%s,%s", EtcdPlane, ControlPlane)
+				backupHosts = hosts.GetUniqueHostList(kubeCluster.EtcdHosts, kubeCluster.ControlPlaneHosts, nil)
 			}
 			log.Infof(ctx, "[certificates] Attempting to recover certificates from backup on [%s] hosts", backupPlane)
 
@@ -63,6 +73,14 @@ func SetUpAuthentication(ctx context.Context, kubeCluster, currentCluster *Clust
 					kubeCluster.Certificates, err = regenerateAPICertificate(kubeCluster, kubeCluster.Certificates)
 					if err != nil {
 						return fmt.Errorf("Failed to regenerate KubeAPI certificate %v", err)
+					}
+				}
+				// this is the case of handling upgrades for API server aggregation layer ca cert and API server proxy client key and cert
+				if kubeCluster.Certificates[pki.RequestHeaderCACertName].Certificate == nil {
+
+					kubeCluster.Certificates, err = regenerateAPIAggregationCerts(kubeCluster, kubeCluster.Certificates)
+					if err != nil {
+						return fmt.Errorf("Failed to regenerate Aggregation layer certificates %v", err)
 					}
 				}
 				return nil
@@ -227,4 +245,85 @@ func fetchBackupCertificates(ctx context.Context, backupHosts []*hosts.Host, kub
 	}
 	// reporting the last error only.
 	return nil, err
+}
+
+func fetchCertificatesFromEtcd(ctx context.Context, kubeCluster *Cluster) ([]byte, []byte, error) {
+	// Get kubernetes certificates from the etcd hosts
+	certificates := map[string]pki.CertificatePKI{}
+	var err error
+	for _, host := range kubeCluster.EtcdHosts {
+		certificates, err = pki.FetchCertificatesFromHost(ctx, kubeCluster.EtcdHosts, host, kubeCluster.SystemImages.Alpine, kubeCluster.LocalKubeConfigPath, kubeCluster.PrivateRegistriesMap)
+		if certificates != nil {
+			break
+		}
+	}
+	if err != nil || certificates == nil {
+		return nil, nil, fmt.Errorf("Failed to fetch certificates from etcd hosts: %v", err)
+	}
+	clientCert := cert.EncodeCertPEM(certificates[pki.KubeNodeCertName].Certificate)
+	clientkey := cert.EncodePrivateKeyPEM(certificates[pki.KubeNodeCertName].Key)
+	return clientCert, clientkey, nil
+}
+
+func (c *Cluster) SaveBackupCertificateBundle(ctx context.Context) error {
+	backupHosts := c.getBackupHosts()
+	var errgrp errgroup.Group
+
+	for _, host := range backupHosts {
+		runHost := host
+		errgrp.Go(func() error {
+			return pki.SaveBackupBundleOnHost(ctx, runHost, c.SystemImages.Alpine, services.EtcdSnapshotPath, c.PrivateRegistriesMap)
+		})
+	}
+	return errgrp.Wait()
+}
+
+func (c *Cluster) ExtractBackupCertificateBundle(ctx context.Context) error {
+	backupHosts := c.getBackupHosts()
+	var errgrp errgroup.Group
+	errList := []string{}
+	for _, host := range backupHosts {
+		runHost := host
+		errgrp.Go(func() error {
+			if err := pki.ExtractBackupBundleOnHost(ctx, runHost, c.SystemImages.Alpine, services.EtcdSnapshotPath, c.PrivateRegistriesMap); err != nil {
+				errList = append(errList, fmt.Errorf(
+					"Failed to extract certificate bundle on host [%s], please make sure etcd bundle exist in /opt/rke/etcd-snapshots/pki.bundle.tar.gz: %v", runHost.Address, err).Error())
+			}
+			return nil
+		})
+	}
+	errgrp.Wait()
+	if len(errList) == len(backupHosts) {
+		return fmt.Errorf(strings.Join(errList, ","))
+	}
+	return nil
+}
+
+func (c *Cluster) getBackupHosts() []*hosts.Host {
+	var backupHosts []*hosts.Host
+	if len(c.Services.Etcd.ExternalURLs) > 0 {
+		backupHosts = c.ControlPlaneHosts
+	} else {
+		// Save certificates on etcd and controlplane hosts
+		backupHosts = hosts.GetUniqueHostList(c.EtcdHosts, c.ControlPlaneHosts, nil)
+	}
+	return backupHosts
+}
+
+func regenerateAPIAggregationCerts(c *Cluster, certificates map[string]pki.CertificatePKI) (map[string]pki.CertificatePKI, error) {
+	logrus.Debugf("[certificates] Regenerating Kubernetes API server aggregation layer requestheader client CA certificates")
+	requestHeaderCACrt, requestHeaderCAKey, err := pki.GenerateCACertAndKey(pki.RequestHeaderCACertName)
+	if err != nil {
+		return nil, err
+	}
+	certificates[pki.RequestHeaderCACertName] = pki.ToCertObject(pki.RequestHeaderCACertName, "", "", requestHeaderCACrt, requestHeaderCAKey)
+
+	//generate API server proxy client key and certs
+	logrus.Debugf("[certificates] Regenerating Kubernetes API server proxy client certificates")
+	apiserverProxyClientCrt, apiserverProxyClientKey, err := pki.GenerateSignedCertAndKey(requestHeaderCACrt, requestHeaderCAKey, true, pki.APIProxyClientCertName, nil, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	certificates[pki.APIProxyClientCertName] = pki.ToCertObject(pki.APIProxyClientCertName, "", "", apiserverProxyClientCrt, apiserverProxyClientKey)
+	return certificates, nil
 }

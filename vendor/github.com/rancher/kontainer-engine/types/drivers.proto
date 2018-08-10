@@ -40,10 +40,18 @@ message DriverOptions {
     map<string, int64> int_options = 3;
 
     map<string, StringSlice> string_slice_options = 4;
+
+    map<string, BoolPointer> bool_pointer_options = 5;
 }
 
 message StringSlice {
     repeated string value = 1;
+}
+
+enum BoolPointer {
+    TRUE = 0;
+    FALSE = 1;
+    NIL = 2;
 }
 
 message ClusterInfo {

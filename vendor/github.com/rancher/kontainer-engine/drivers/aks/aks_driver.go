@@ -17,9 +17,9 @@ import (
 	"github.com/Azure/go-autorest/autorest/azure"
 	"github.com/Azure/go-autorest/autorest/to"
 	"github.com/pkg/errors"
+	"github.com/rancher/kontainer-engine/drivers/options"
 	"github.com/rancher/kontainer-engine/drivers/util"
 	"github.com/rancher/kontainer-engine/types"
-	"github.com/rancher/types/apis/management.cattle.io/v3"
 	"github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v2"
 	"k8s.io/client-go/kubernetes"
@@ -34,13 +34,32 @@ type state struct {
 	// Path to the public key to use for SSH into cluster
 	SSHPublicKeyPath string `json:"sshPublicKeyPath,omitempty"`
 
-	v3.AzureKubernetesServiceConfig
-
 	// Cluster Name
 	Name string
 
 	// The name that is displayed to the user on the Rancher UI
 	DisplayName string
+
+	AgentDNSPrefix              string
+	AgentVMSize                 string
+	Count                       int64
+	KubernetesVersion           string
+	Location                    string
+	OsDiskSizeGB                int64
+	SubscriptionID              string
+	ResourceGroup               string
+	AgentPoolName               string
+	MasterDNSPrefix             string
+	SSHPublicKeyContents        string
+	AdminUsername               string
+	BaseURL                     string
+	ClientID                    string
+	TenantID                    string
+	ClientSecret                string
+	VirtualNetwork              string
+	Subnet                      string
+	VirtualNetworkResourceGroup string
+	Tag                         map[string]string
 
 	// Cluster info
 	ClusterInfo types.ClusterInfo
@@ -66,6 +85,10 @@ func (d *Driver) GetDriverCreateOptions(ctx context.Context) (*types.DriverFlags
 	driverFlag := types.DriverFlags{
 		Options: make(map[string]*types.Flag),
 	}
+	driverFlag.Options["name"] = &types.Flag{
+		Type:  types.StringType,
+		Usage: "The internal name of the cluster in Rancher",
+	}
 	driverFlag.Options["display-name"] = &types.Flag{
 		Type:  types.StringType,
 		Usage: "The name that is displayed to the user on the Rancher UI",
@@ -87,16 +110,16 @@ func (d *Driver) GetDriverCreateOptions(ctx context.Context) (*types.DriverFlags
 		Type:  types.StringSliceType,
 		Usage: "Resource tags. For example, foo=bar",
 	}
-	driverFlag.Options["node-count"] = &types.Flag{
+	driverFlag.Options["count"] = &types.Flag{
 		Type:  types.IntType,
 		Usage: "Number of agents (VMs) to host docker containers. Allowed values must be in the range of 1 to 100 (inclusive)",
 		Value: "1",
 	}
-	driverFlag.Options["node-dns-prefix"] = &types.Flag{
+	driverFlag.Options["agent-dns-prefix"] = &types.Flag{
 		Type:  types.StringType,
 		Usage: "DNS prefix to be used to create the FQDN for the agent pool",
 	}
-	driverFlag.Options["node-pool-name"] = &types.Flag{
+	driverFlag.Options["agent-pool-name"] = &types.Flag{
 		Type:  types.StringType,
 		Usage: "Name for the agent pool",
 		Value: "agentpool0",
@@ -105,7 +128,7 @@ func (d *Driver) GetDriverCreateOptions(ctx context.Context) (*types.DriverFlags
 		Type:  types.StringType,
 		Usage: "OS Disk Size in GB to be used to specify the disk size for every machine in this master/agent pool. If you specify 0, it will apply the default osDisk size according to the vmSize specified.",
 	}
-	driverFlag.Options["node-vm-size"] = &types.Flag{
+	driverFlag.Options["agent-vm-size"] = &types.Flag{
 		Type:  types.StringType,
 		Usage: "Size of agent VMs",
 		Value: "Standard_D1_v2",
@@ -117,7 +140,11 @@ func (d *Driver) GetDriverCreateOptions(ctx context.Context) (*types.DriverFlags
 	}
 	driverFlag.Options["public-key"] = &types.Flag{
 		Type:  types.StringType,
-		Usage: "SSH public key to use for the cluster",
+		Usage: "Path to the SSH public key to use for the cluster",
+	}
+	driverFlag.Options["ssh-public-key-contents"] = &types.Flag{
+		Type:  types.StringType,
+		Usage: "Contents of the SSH public key to use for the cluster",
 	}
 	driverFlag.Options["master-dns-prefix"] = &types.Flag{
 		Type:  types.StringType,
@@ -145,6 +172,18 @@ func (d *Driver) GetDriverCreateOptions(ctx context.Context) (*types.DriverFlags
 		Type:  types.StringType,
 		Usage: "Azure tenant id to use",
 	}
+	driverFlag.Options["virtual-network"] = &types.Flag{
+		Type:  types.StringType,
+		Usage: "Azure virtual network to use",
+	}
+	driverFlag.Options["subnet"] = &types.Flag{
+		Type:  types.StringType,
+		Usage: "Azure subnet to use",
+	}
+	driverFlag.Options["virtual-network-resource-group"] = &types.Flag{
+		Type:  types.StringType,
+		Usage: "The resource group that the virtual network is in",
+	}
 
 	return &driverFlag, nil
 }
@@ -169,26 +208,29 @@ func (d *Driver) GetDriverUpdateOptions(ctx context.Context) (*types.DriverFlags
 // SetDriverOptions implements driver interface
 func getStateFromOptions(driverOptions *types.DriverOptions) (state, error) {
 	state := state{}
-	state.Name = getValueFromDriverOptions(driverOptions, types.StringType, "name").(string)
-	state.DisplayName = getValueFromDriverOptions(driverOptions, types.StringType, "display-name", "displayName").(string)
-	state.AgentDNSPrefix = getValueFromDriverOptions(driverOptions, types.StringType, "node-dns-prefix", "agentDnsPrefix").(string)
-	state.AgentVMSize = getValueFromDriverOptions(driverOptions, types.StringType, "node-vm-size", "agentVmSize").(string)
-	state.Count = getValueFromDriverOptions(driverOptions, types.IntType, "node-count", "count").(int64)
-	state.KubernetesVersion = getValueFromDriverOptions(driverOptions, types.StringType, "kubernetes-version", "kubernetesVersion").(string)
-	state.Location = getValueFromDriverOptions(driverOptions, types.StringType, "location").(string)
-	state.OsDiskSizeGB = getValueFromDriverOptions(driverOptions, types.IntType, "os-disk-size", "osDiskSizeGb").(int64)
-	state.SubscriptionID = getValueFromDriverOptions(driverOptions, types.StringType, "subscription-id", "subscriptionId").(string)
-	state.ResourceGroup = getValueFromDriverOptions(driverOptions, types.StringType, "resource-group", "resourceGroup").(string)
-	state.AgentPoolName = getValueFromDriverOptions(driverOptions, types.StringType, "node-pool-name", "agentPoolName").(string)
-	state.MasterDNSPrefix = getValueFromDriverOptions(driverOptions, types.StringType, "master-dns-prefix", "masterDnsPrefix").(string)
-	state.SSHPublicKeyPath = getValueFromDriverOptions(driverOptions, types.StringType, "public-key").(string)
-	state.SSHPublicKeyContents = getValueFromDriverOptions(driverOptions, types.StringType, "sshPublicKeyContents").(string)
-	state.AdminUsername = getValueFromDriverOptions(driverOptions, types.StringType, "admin-username", "adminUsername").(string)
-	state.BaseURL = getValueFromDriverOptions(driverOptions, types.StringType, "base-url").(string)
-	state.ClientID = getValueFromDriverOptions(driverOptions, types.StringType, "client-id", "clientId").(string)
-	state.TenantID = getValueFromDriverOptions(driverOptions, types.StringType, "tenant-id", "tenantId").(string)
-	state.ClientSecret = getValueFromDriverOptions(driverOptions, types.StringType, "client-secret", "clientSecret").(string)
-	tagValues := getValueFromDriverOptions(driverOptions, types.StringSliceType).(*types.StringSlice)
+	state.Name = options.GetValueFromDriverOptions(driverOptions, types.StringType, "name").(string)
+	state.DisplayName = options.GetValueFromDriverOptions(driverOptions, types.StringType, "display-name", "displayName").(string)
+	state.AgentDNSPrefix = options.GetValueFromDriverOptions(driverOptions, types.StringType, "agent-dns-prefix", "agentDnsPrefix").(string)
+	state.AgentVMSize = options.GetValueFromDriverOptions(driverOptions, types.StringType, "agent-vm-size", "agentVmSize").(string)
+	state.Count = options.GetValueFromDriverOptions(driverOptions, types.IntType, "count").(int64)
+	state.KubernetesVersion = options.GetValueFromDriverOptions(driverOptions, types.StringType, "kubernetes-version", "kubernetesVersion").(string)
+	state.Location = options.GetValueFromDriverOptions(driverOptions, types.StringType, "location").(string)
+	state.OsDiskSizeGB = options.GetValueFromDriverOptions(driverOptions, types.IntType, "os-disk-size", "osDiskSizeGb").(int64)
+	state.SubscriptionID = options.GetValueFromDriverOptions(driverOptions, types.StringType, "subscription-id", "subscriptionId").(string)
+	state.ResourceGroup = options.GetValueFromDriverOptions(driverOptions, types.StringType, "resource-group", "resourceGroup").(string)
+	state.AgentPoolName = options.GetValueFromDriverOptions(driverOptions, types.StringType, "agent-pool-name", "agentPoolName").(string)
+	state.MasterDNSPrefix = options.GetValueFromDriverOptions(driverOptions, types.StringType, "master-dns-prefix", "masterDnsPrefix").(string)
+	state.SSHPublicKeyPath = options.GetValueFromDriverOptions(driverOptions, types.StringType, "public-key").(string)
+	state.SSHPublicKeyContents = options.GetValueFromDriverOptions(driverOptions, types.StringType, "sshPublicKeyContents").(string)
+	state.AdminUsername = options.GetValueFromDriverOptions(driverOptions, types.StringType, "admin-username", "adminUsername").(string)
+	state.BaseURL = options.GetValueFromDriverOptions(driverOptions, types.StringType, "base-url").(string)
+	state.ClientID = options.GetValueFromDriverOptions(driverOptions, types.StringType, "client-id", "clientId").(string)
+	state.TenantID = options.GetValueFromDriverOptions(driverOptions, types.StringType, "tenant-id", "tenantId").(string)
+	state.ClientSecret = options.GetValueFromDriverOptions(driverOptions, types.StringType, "client-secret", "clientSecret").(string)
+	state.VirtualNetwork = options.GetValueFromDriverOptions(driverOptions, types.StringType, "virtualNetwork", "virtual-network").(string)
+	state.Subnet = options.GetValueFromDriverOptions(driverOptions, types.StringType, "subnet").(string)
+	state.VirtualNetworkResourceGroup = options.GetValueFromDriverOptions(driverOptions, types.StringType, "virtualNetworkResourceGroup", "virtual-network-resource-group").(string)
+	tagValues := options.GetValueFromDriverOptions(driverOptions, types.StringSliceType).(*types.StringSlice)
 	for _, part := range tagValues.Value {
 		kv := strings.Split(part, "=")
 		if len(kv) == 2 {
@@ -196,40 +238,6 @@ func getStateFromOptions(driverOptions *types.DriverOptions) (state, error) {
 		}
 	}
 	return state, state.validate()
-}
-
-func getValueFromDriverOptions(driverOptions *types.DriverOptions, optionType string, keys ...string) interface{} {
-	switch optionType {
-	case types.IntType:
-		for _, key := range keys {
-			if value, ok := driverOptions.IntOptions[key]; ok {
-				return value
-			}
-		}
-		return int64(0)
-	case types.StringType:
-		for _, key := range keys {
-			if value, ok := driverOptions.StringOptions[key]; ok {
-				return value
-			}
-		}
-		return ""
-	case types.BoolType:
-		for _, key := range keys {
-			if value, ok := driverOptions.BoolOptions[key]; ok {
-				return value
-			}
-		}
-		return false
-	case types.StringSliceType:
-		for _, key := range keys {
-			if value, ok := driverOptions.StringSliceOptions[key]; ok {
-				return value
-			}
-		}
-		return &types.StringSlice{}
-	}
-	return nil
 }
 
 func (state *state) validate() error {
@@ -333,8 +341,15 @@ const updatingStatus = "Updating"
 
 const pollInterval = 30
 
-// Create implements driver interface
 func (d *Driver) Create(ctx context.Context, options *types.DriverOptions, _ *types.ClusterInfo) (*types.ClusterInfo, error) {
+	return d.createOrUpdate(ctx, options)
+}
+
+func (d *Driver) Update(ctx context.Context, info *types.ClusterInfo, options *types.DriverOptions) (*types.ClusterInfo, error) {
+	return d.createOrUpdate(ctx, options)
+}
+
+func (d *Driver) createOrUpdate(ctx context.Context, options *types.DriverOptions) (*types.ClusterInfo, error) {
 	driverState, err := getStateFromOptions(options)
 	if err != nil {
 		return nil, err
@@ -394,9 +409,27 @@ func (d *Driver) Create(ctx context.Context, options *types.DriverOptions, _ *ty
 		}
 	}
 
+	var vmNetSubnetID *string
+	if driverState.VirtualNetwork != "" && driverState.Subnet != "" {
+		virtualNetworkResourceGroup := driverState.ResourceGroup
+
+		// if virtual network resource group is set, use it, otherwise assume it is the same as the cluster
+		if driverState.VirtualNetworkResourceGroup != "" {
+			virtualNetworkResourceGroup = driverState.VirtualNetworkResourceGroup
+		}
+
+		vmNetSubnetID = to.StringPtr(fmt.Sprintf(
+			"/subscriptions/%v/resourceGroups/%v/providers/Microsoft.Network/virtualNetworks/%v/subnets/%v",
+			driverState.SubscriptionID,
+			virtualNetworkResourceGroup,
+			driverState.VirtualNetwork,
+			driverState.Subnet,
+		))
+	}
+
 	_, err = clustersClient.CreateOrUpdate(ctx, driverState.ResourceGroup, driverState.Name, containerservice.ManagedCluster{
 		Location: to.StringPtr(driverState.Location),
-		Tags:     &tags,
+		Tags:     tags,
 		ManagedClusterProperties: &containerservice.ManagedClusterProperties{
 			KubernetesVersion: to.StringPtr(driverState.KubernetesVersion),
 			DNSPrefix:         to.StringPtr(masterDNSPrefix),
@@ -412,10 +445,11 @@ func (d *Driver) Create(ctx context.Context, options *types.DriverOptions, _ *ty
 			},
 			AgentPoolProfiles: &[]containerservice.AgentPoolProfile{
 				{
-					DNSPrefix: to.StringPtr(agentDNSPrefix),
-					Name:      to.StringPtr(driverState.AgentPoolName),
-					VMSize:    containerservice.VMSizeTypes(driverState.AgentVMSize),
-					Count:     to.Int32Ptr(int32(driverState.Count)),
+					DNSPrefix:    to.StringPtr(agentDNSPrefix),
+					Name:         to.StringPtr(driverState.AgentPoolName),
+					VMSize:       containerservice.VMSizeTypes(driverState.AgentVMSize),
+					Count:        to.Int32Ptr(int32(driverState.Count)),
+					VnetSubnetID: vmNetSubnetID,
 				},
 			},
 			ServicePrincipalProfile: &containerservice.ServicePrincipalProfile{
@@ -519,12 +553,6 @@ func getState(info *types.ClusterInfo) (state, error) {
 	}
 
 	return state, err
-}
-
-// Update implements driver interface
-func (d *Driver) Update(ctx context.Context, info *types.ClusterInfo, options *types.DriverOptions) (*types.ClusterInfo, error) {
-	// todo: implement
-	return nil, fmt.Errorf("not implemented")
 }
 
 func (d *Driver) GetVersion(ctx context.Context, info *types.ClusterInfo) (*types.KubernetesVersion, error) {
@@ -697,15 +725,8 @@ func (d *Driver) PostCheck(ctx context.Context, info *types.ClusterInfo) (*types
 		return nil, err
 	}
 
-	decoded := make([]byte, base64.StdEncoding.DecodedLen(len(*result.KubeConfig)))
-	l, err := base64.StdEncoding.Decode(decoded, []byte(*result.KubeConfig))
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode kubeconfig: %v", err)
-	}
-
 	clusterConfig := KubeConfig{}
-	err = yaml.Unmarshal(decoded[:l], &clusterConfig)
+	err = yaml.Unmarshal(*result.KubeConfig, &clusterConfig)
 
 	if err != nil {
 		return nil, fmt.Errorf("failed to unmarshal kubeconfig: %v", err)
@@ -781,7 +802,6 @@ func (d *Driver) PostCheck(ctx context.Context, info *types.ClusterInfo) (*types
 	return info, nil
 }
 
-// Remove implements driver interface
 func (d *Driver) Remove(ctx context.Context, info *types.ClusterInfo) error {
 	state, err := getState(info)
 

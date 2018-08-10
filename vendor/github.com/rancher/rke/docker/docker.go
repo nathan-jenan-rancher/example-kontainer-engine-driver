@@ -2,6 +2,7 @@ package docker
 
 import (
 	"archive/tar"
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -10,12 +11,14 @@ import (
 	"io/ioutil"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/coreos/go-semver/semver"
 	ref "github.com/docker/distribution/reference"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/rancher/rke/log"
 	"github.com/rancher/types/apis/management.cattle.io/v3"
 	"github.com/sirupsen/logrus"
@@ -24,6 +27,7 @@ import (
 
 const (
 	DockerRegistryURL = "docker.io"
+	RestartTimeout    = 30
 )
 
 var K8sDockerVersions = map[string][]string{
@@ -53,8 +57,16 @@ func DoRunContainer(ctx context.Context, dClient *client.Client, imageCfg *conta
 	}
 	// Check for upgrades
 	if container.State.Running {
+		// check if container is in a restarting loop
+		if container.State.Restarting {
+			logrus.Debugf("[%s] Container [%s] is in a restarting loop [%s]", plane, containerName, hostname)
+			restartTimeoutDuration := RestartTimeout * time.Second
+			if err := dClient.ContainerRestart(ctx, container.ID, &restartTimeoutDuration); err != nil {
+				return fmt.Errorf("Failed to start [%s] container on host [%s]: %v", containerName, hostname, err)
+			}
+		}
 		logrus.Debugf("[%s] Container [%s] is already running on host [%s]", plane, containerName, hostname)
-		isUpgradable, err := IsContainerUpgradable(ctx, dClient, imageCfg, containerName, hostname, plane)
+		isUpgradable, err := IsContainerUpgradable(ctx, dClient, imageCfg, hostCfg, containerName, hostname, plane)
 		if err != nil {
 			return err
 		}
@@ -266,26 +278,30 @@ func StopRenameContainer(ctx context.Context, dClient *client.Client, hostname s
 	if err := StopContainer(ctx, dClient, hostname, oldContainerName); err != nil {
 		return err
 	}
-	if err := WaitForContainer(ctx, dClient, hostname, oldContainerName); err != nil {
+	if _, err := WaitForContainer(ctx, dClient, hostname, oldContainerName); err != nil {
 		return nil
 	}
 	return RenameContainer(ctx, dClient, hostname, oldContainerName, newContainerName)
 
 }
 
-func WaitForContainer(ctx context.Context, dClient *client.Client, hostname string, containerName string) error {
+func WaitForContainer(ctx context.Context, dClient *client.Client, hostname string, containerName string) (int64, error) {
+	// We capture the status exit code of the container
 	statusCh, errCh := dClient.ContainerWait(ctx, containerName, container.WaitConditionNotRunning)
 	select {
 	case err := <-errCh:
 		if err != nil {
-			return fmt.Errorf("Error waiting for container [%s] on host [%s]: %v", containerName, hostname, err)
+			// if error is present return 1 exit code
+			return 1, fmt.Errorf("Error waiting for container [%s] on host [%s]: %v", containerName, hostname, err)
 		}
-	case <-statusCh:
+	case status := <-statusCh:
+		// return the status exit code of the container
+		return status.StatusCode, nil
 	}
-	return nil
+	return 0, nil
 }
 
-func IsContainerUpgradable(ctx context.Context, dClient *client.Client, imageCfg *container.Config, containerName string, hostname string, plane string) (bool, error) {
+func IsContainerUpgradable(ctx context.Context, dClient *client.Client, imageCfg *container.Config, hostCfg *container.HostConfig, containerName string, hostname string, plane string) (bool, error) {
 	logrus.Debugf("[%s] Checking if container [%s] is eligible for upgrade on host [%s]", plane, containerName, hostname)
 	// this should be moved to a higher layer.
 
@@ -293,9 +309,20 @@ func IsContainerUpgradable(ctx context.Context, dClient *client.Client, imageCfg
 	if err != nil {
 		return false, err
 	}
+	// image inspect to compare the env correctly
+	imageInspect, _, err := dClient.ImageInspectWithRaw(ctx, imageCfg.Image)
+	if err != nil {
+		if !client.IsErrNotFound(err) {
+			return false, err
+		}
+		logrus.Debugf("[%s] Container [%s] is eligible for upgrade on host [%s]", plane, containerName, hostname)
+		return true, nil
+	}
 	if containerInspect.Config.Image != imageCfg.Image ||
 		!sliceEqualsIgnoreOrder(containerInspect.Config.Entrypoint, imageCfg.Entrypoint) ||
-		!sliceEqualsIgnoreOrder(containerInspect.Config.Cmd, imageCfg.Cmd) {
+		!sliceEqualsIgnoreOrder(containerInspect.Config.Cmd, imageCfg.Cmd) ||
+		!isContainerEnvChanged(containerInspect.Config.Env, imageCfg.Env, imageInspect.Config.Env) ||
+		!sliceEqualsIgnoreOrder(containerInspect.HostConfig.Binds, hostCfg.Binds) {
 		logrus.Debugf("[%s] Container [%s] is eligible for upgrade on host [%s]", plane, containerName, hostname)
 		return true, nil
 	}
@@ -342,8 +369,23 @@ func ReadFileFromContainer(ctx context.Context, dClient *client.Client, hostname
 	return string(file), nil
 }
 
-func ReadContainerLogs(ctx context.Context, dClient *client.Client, containerName string) (io.ReadCloser, error) {
-	return dClient.ContainerLogs(ctx, containerName, types.ContainerLogsOptions{Follow: true, ShowStdout: true, ShowStderr: true, Timestamps: false})
+func ReadContainerLogs(ctx context.Context, dClient *client.Client, containerName string, follow bool, tail string) (io.ReadCloser, error) {
+	return dClient.ContainerLogs(ctx, containerName, types.ContainerLogsOptions{Follow: follow, ShowStdout: true, ShowStderr: true, Timestamps: false, Tail: tail})
+}
+
+func GetContainerLogsStdoutStderr(ctx context.Context, dClient *client.Client, containerName, tail string, follow bool) (string, error) {
+	var containerStderr bytes.Buffer
+	var containerStdout bytes.Buffer
+	var containerLog string
+	clogs, logserr := ReadContainerLogs(ctx, dClient, containerName, follow, tail)
+	if logserr != nil {
+		logrus.Debug("logserr: %v", logserr)
+		return containerLog, fmt.Errorf("Failed to get gather logs from container [%s]: %v", containerName, logserr)
+	}
+	defer clogs.Close()
+	stdcopy.StdCopy(&containerStdout, &containerStderr, clogs)
+	containerLog = containerStderr.String()
+	return containerLog, nil
 }
 
 func tryRegistryAuth(pr v3.PrivateRegistry) types.RequestPrivilegeFunc {
@@ -385,4 +427,10 @@ func convertToSemver(version string) (*semver.Version, error) {
 	}
 	compVersion[2] = "0"
 	return semver.NewVersion(strings.Join(compVersion, "."))
+}
+
+func isContainerEnvChanged(containerEnv, imageConfigEnv, dockerfileEnv []string) bool {
+	// remove PATH env from the container env
+	allImageEnv := append(imageConfigEnv, dockerfileEnv...)
+	return sliceEqualsIgnoreOrder(allImageEnv, containerEnv)
 }

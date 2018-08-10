@@ -3,7 +3,6 @@ package services
 import (
 	"context"
 	"fmt"
-	"path"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/rancher/rke/docker"
@@ -21,24 +20,25 @@ const (
 	SidekickServiceName   = "sidekick"
 	RBACAuthorizationMode = "rbac"
 
-	KubeAPIContainerName        = "kube-apiserver"
-	KubeletContainerName        = "kubelet"
-	KubeproxyContainerName      = "kube-proxy"
-	KubeControllerContainerName = "kube-controller-manager"
-	SchedulerContainerName      = "kube-scheduler"
-	EtcdContainerName           = "etcd"
-	NginxProxyContainerName     = "nginx-proxy"
-	SidekickContainerName       = "service-sidekick"
-	LogLinkContainerName        = "rke-log-linker"
-	LogCleanerContainerName     = "rke-log-cleaner"
+	KubeAPIContainerName          = "kube-apiserver"
+	KubeletContainerName          = "kubelet"
+	KubeproxyContainerName        = "kube-proxy"
+	KubeControllerContainerName   = "kube-controller-manager"
+	SchedulerContainerName        = "kube-scheduler"
+	EtcdContainerName             = "etcd"
+	EtcdSnapshotContainerName     = "etcd-rolling-snapshots"
+	EtcdSnapshotOnceContainerName = "etcd-snapshot-once"
+	EtcdRestoreContainerName      = "etcd-restore"
+	NginxProxyContainerName       = "nginx-proxy"
+	SidekickContainerName         = "service-sidekick"
+	LogLinkContainerName          = "rke-log-linker"
+	LogCleanerContainerName       = "rke-log-cleaner"
 
 	KubeAPIPort        = 6443
 	SchedulerPort      = 10251
 	KubeControllerPort = 10252
 	KubeletPort        = 10250
 	KubeproxyPort      = 10256
-
-	RKELogsPath = "/var/lib/rancher/rke/log"
 )
 
 func runSidekick(ctx context.Context, host *hosts.Host, prsMap map[string]v3.PrivateRegistry, sidecarProcess v3.Process) error {
@@ -46,15 +46,27 @@ func runSidekick(ctx context.Context, host *hosts.Host, prsMap map[string]v3.Pri
 	if err != nil {
 		return err
 	}
+	imageCfg, hostCfg, _ := GetProcessConfig(sidecarProcess)
+	isUpgradable := false
 	if isRunning {
-		log.Infof(ctx, "[%s] Sidekick container already created on host [%s]", SidekickServiceName, host.Address)
-		return nil
+		isUpgradable, err = docker.IsContainerUpgradable(ctx, host.DClient, imageCfg, hostCfg, SidekickContainerName, host.Address, SidekickServiceName)
+		if err != nil {
+			return err
+		}
+
+		if !isUpgradable {
+			log.Infof(ctx, "[%s] Sidekick container already created on host [%s]", SidekickServiceName, host.Address)
+			return nil
+		}
 	}
 
-	imageCfg, hostCfg, _ := GetProcessConfig(sidecarProcess)
-	sidecarImage := sidecarProcess.Image
-	if err := docker.UseLocalOrPull(ctx, host.DClient, host.Address, sidecarImage, SidekickServiceName, prsMap); err != nil {
+	if err := docker.UseLocalOrPull(ctx, host.DClient, host.Address, sidecarProcess.Image, SidekickServiceName, prsMap); err != nil {
 		return err
+	}
+	if isUpgradable {
+		if err := docker.DoRemoveContainer(ctx, host.DClient, SidekickContainerName, host.Address); err != nil {
+			return err
+		}
 	}
 	if _, err := docker.CreateContainer(ctx, host.DClient, host.Address, SidekickContainerName, imageCfg, hostCfg); err != nil {
 		return err
@@ -72,6 +84,7 @@ func GetProcessConfig(process v3.Process) (*container.Config, *container.HostCon
 		Cmd:        process.Args,
 		Env:        process.Env,
 		Image:      process.Image,
+		Labels:     process.Labels,
 	}
 	// var pidMode container.PidMode
 	// pidMode = process.PidMode
@@ -103,19 +116,19 @@ func createLogLink(ctx context.Context, host *hosts.Host, containerName, plane, 
 	}
 	containerID := containerInspect.ID
 	containerLogPath := containerInspect.LogPath
-	containerLogLink := fmt.Sprintf("%s/%s_%s.log", RKELogsPath, containerName, containerID)
+	containerLogLink := fmt.Sprintf("%s/%s_%s.log", hosts.RKELogsPath, containerName, containerID)
 	imageCfg := &container.Config{
 		Image: image,
 		Tty:   true,
 		Cmd: []string{
 			"sh",
 			"-c",
-			fmt.Sprintf("mkdir -p %s ; ln -s %s %s", RKELogsPath, containerLogPath, containerLogLink),
+			fmt.Sprintf("mkdir -p %s ; ln -s %s %s", hosts.RKELogsPath, containerLogPath, containerLogLink),
 		},
 	}
 	hostCfg := &container.HostConfig{
 		Binds: []string{
-			fmt.Sprintf("%s:/var/lib", path.Join(host.PrefixPath, "/var/lib")),
+			"/var/lib:/var/lib",
 		},
 		Privileged: true,
 	}

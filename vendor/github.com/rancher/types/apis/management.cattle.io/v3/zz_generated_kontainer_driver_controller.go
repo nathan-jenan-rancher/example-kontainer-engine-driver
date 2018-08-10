@@ -95,7 +95,7 @@ func (l *kontainerDriverLister) Get(namespace, name string) (*KontainerDriver, e
 		return nil, errors.NewNotFound(schema.GroupResource{
 			Group:    KontainerDriverGroupVersionKind.Group,
 			Resource: "kontainerDriver",
-		}, name)
+		}, key)
 	}
 	return obj.(*KontainerDriver), nil
 }

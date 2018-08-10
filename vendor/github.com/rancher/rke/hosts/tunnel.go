@@ -6,7 +6,6 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"net"
 
@@ -23,7 +22,7 @@ const (
 	K8sVersion       = "1.8"
 )
 
-func (h *Host) TunnelUp(ctx context.Context, dialerFactory DialerFactory) error {
+func (h *Host) TunnelUp(ctx context.Context, dialerFactory DialerFactory, clusterPrefixPath string) error {
 	if h.DClient != nil {
 		return nil
 	}
@@ -38,7 +37,11 @@ func (h *Host) TunnelUp(ctx context.Context, dialerFactory DialerFactory) error 
 	if err != nil {
 		return fmt.Errorf("Can't initiate NewClient: %v", err)
 	}
-	return checkDockerVersion(ctx, h)
+	if err := checkDockerVersion(ctx, h); err != nil {
+		return err
+	}
+	h.PrefixPath = GetPrefixPath(h.DockerInfo.OperatingSystem, clusterPrefixPath)
+	return nil
 }
 
 func (h *Host) TunnelUpLocal(ctx context.Context) error {
@@ -79,11 +82,7 @@ func parsePrivateKey(keyBuff string) (ssh.Signer, error) {
 	return ssh.ParsePrivateKey([]byte(keyBuff))
 }
 
-func parsePrivateKeyWithPassPhrase(keyBuff string, passphrase []byte) (ssh.Signer, error) {
-	return ssh.ParsePrivateKeyWithPassphrase([]byte(keyBuff), passphrase)
-}
-
-func getSSHConfig(username, sshPrivateKeyString string, passphrase []byte, useAgentAuth bool) (*ssh.ClientConfig, error) {
+func getSSHConfig(username, sshPrivateKeyString string, useAgentAuth bool) (*ssh.ClientConfig, error) {
 	config := &ssh.ClientConfig{
 		User:            username,
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
@@ -104,7 +103,7 @@ func getSSHConfig(username, sshPrivateKeyString string, passphrase []byte, useAg
 		}
 	}
 
-	signer, err := getPrivateKeySigner(sshPrivateKeyString, passphrase)
+	signer, err := parsePrivateKey(sshPrivateKeyString)
 	if err != nil {
 		return config, err
 	}
@@ -113,18 +112,25 @@ func getSSHConfig(username, sshPrivateKeyString string, passphrase []byte, useAg
 	return config, nil
 }
 
-func getPrivateKeySigner(sshPrivateKeyString string, passphrase []byte) (ssh.Signer, error) {
-	key, err := parsePrivateKey(sshPrivateKeyString)
-	if err != nil && strings.Contains(err.Error(), "decode encrypted private keys") {
-		key, err = parsePrivateKeyWithPassPhrase(sshPrivateKeyString, passphrase)
+func privateKeyPath(sshKeyPath string) (string, error) {
+	if sshKeyPath[:2] == "~/" {
+		sshKeyPath = filepath.Join(userHome(), sshKeyPath[2:])
 	}
-	return key, err
+	buff, err := ioutil.ReadFile(sshKeyPath)
+	if err != nil {
+		return "", fmt.Errorf("Error while reading SSH key file: %v", err)
+	}
+	return string(buff), nil
 }
 
-func privateKeyPath(sshKeyPath string) string {
-	if sshKeyPath[:2] == "~/" {
-		sshKeyPath = filepath.Join(os.Getenv("HOME"), sshKeyPath[2:])
+func userHome() string {
+	if home := os.Getenv("HOME"); home != "" {
+		return home
 	}
-	buff, _ := ioutil.ReadFile(sshKeyPath)
-	return string(buff)
+	homeDrive := os.Getenv("HOMEDRIVE")
+	homePath := os.Getenv("HOMEPATH")
+	if homeDrive != "" && homePath != "" {
+		return homeDrive + homePath
+	}
+	return os.Getenv("USERPROFILE")
 }

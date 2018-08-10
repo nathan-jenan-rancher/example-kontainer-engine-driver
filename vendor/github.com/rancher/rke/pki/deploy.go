@@ -107,7 +107,6 @@ func DeployCertificatesOnHost(ctx context.Context, host *hosts.Host, crtMap map[
 		"CRTS_DEPLOY_PATH=" + certPath,
 	}
 	for _, crt := range crtMap {
-
 		env = append(env, crt.ToEnv()...)
 	}
 	return doRunDeployer(ctx, host, env, certDownloaderImage, prsMap)
@@ -118,13 +117,15 @@ func FetchCertificatesFromHost(ctx context.Context, extraHosts []*hosts.Host, ho
 	tmpCerts := make(map[string]CertificatePKI)
 
 	crtList := map[string]bool{
-		CACertName:             false,
-		KubeAPICertName:        false,
-		KubeControllerCertName: true,
-		KubeSchedulerCertName:  true,
-		KubeProxyCertName:      true,
-		KubeNodeCertName:       true,
-		KubeAdminCertName:      false,
+		CACertName:              false,
+		KubeAPICertName:         false,
+		KubeControllerCertName:  true,
+		KubeSchedulerCertName:   true,
+		KubeProxyCertName:       true,
+		KubeNodeCertName:        true,
+		KubeAdminCertName:       false,
+		RequestHeaderCACertName: false,
+		APIProxyClientCertName:  false,
 	}
 
 	for _, etcdHost := range extraHosts {
@@ -134,9 +135,11 @@ func FetchCertificatesFromHost(ctx context.Context, extraHosts []*hosts.Host, ho
 
 	for certName, config := range crtList {
 		certificate := CertificatePKI{}
-		crt, err := fetchFileFromHost(ctx, GetCertTempPath(certName), image, host, prsMap)
+		crt, err := FetchFileFromHost(ctx, GetCertTempPath(certName), image, host, prsMap)
 		// I will only exit with an error if it's not a not-found-error and this is not an etcd certificate
-		if err != nil && !strings.HasPrefix(certName, "kube-etcd") {
+		if err != nil && (!strings.HasPrefix(certName, "kube-etcd") &&
+			!strings.Contains(certName, APIProxyClientCertName) &&
+			!strings.Contains(certName, RequestHeaderCACertName)) {
 			if strings.Contains(err.Error(), "no such file or directory") ||
 				strings.Contains(err.Error(), "Could not find the file") {
 				return nil, nil
@@ -144,15 +147,17 @@ func FetchCertificatesFromHost(ctx context.Context, extraHosts []*hosts.Host, ho
 			return nil, err
 
 		}
-		// If I can't find an etcd cert, I will not fail and will create it later.
-		if crt == "" && strings.HasPrefix(certName, "kube-etcd") {
+		// If I can't find an etcd or api aggregator cert, I will not fail and will create it later.
+		if crt == "" && (strings.HasPrefix(certName, "kube-etcd") ||
+			strings.Contains(certName, APIProxyClientCertName) ||
+			strings.Contains(certName, RequestHeaderCACertName)) {
 			tmpCerts[certName] = CertificatePKI{}
 			continue
 		}
-		key, err := fetchFileFromHost(ctx, GetKeyTempPath(certName), image, host, prsMap)
+		key, err := FetchFileFromHost(ctx, GetKeyTempPath(certName), image, host, prsMap)
 
 		if config {
-			config, err := fetchFileFromHost(ctx, GetConfigTempPath(certName), image, host, prsMap)
+			config, err := FetchFileFromHost(ctx, GetConfigTempPath(certName), image, host, prsMap)
 			if err != nil {
 				return nil, err
 			}
@@ -179,7 +184,7 @@ func FetchCertificatesFromHost(ctx context.Context, extraHosts []*hosts.Host, ho
 
 }
 
-func fetchFileFromHost(ctx context.Context, filePath, image string, host *hosts.Host, prsMap map[string]v3.PrivateRegistry) (string, error) {
+func FetchFileFromHost(ctx context.Context, filePath, image string, host *hosts.Host, prsMap map[string]v3.PrivateRegistry) (string, error) {
 
 	imageCfg := &container.Config{
 		Image: image,

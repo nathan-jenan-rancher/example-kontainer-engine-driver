@@ -40,9 +40,8 @@ type ProjectLogging struct {
 type LoggingCommonSpec struct {
 	DisplayName string `json:"displayName,omitempty"`
 
-	OutputFlushInterval int               `json:"outputFlushInterval,omitempty" norman:"default=3"`
-	OutputTags          map[string]string `json:"outputTags,omitempty"`
-
+	OutputFlushInterval int                  `json:"outputFlushInterval,omitempty" norman:"default=3"`
+	OutputTags          map[string]string    `json:"outputTags,omitempty"`
 	ElasticsearchConfig *ElasticsearchConfig `json:"elasticsearchConfig,omitempty"`
 	SplunkConfig        *SplunkConfig        `json:"splunkConfig,omitempty"`
 	KafkaConfig         *KafkaConfig         `json:"kafkaConfig,omitempty"`
@@ -63,8 +62,9 @@ type ProjectLoggingSpec struct {
 }
 
 type ClusterLoggingStatus struct {
-	Conditions  []LoggingCondition `json:"conditions,omitempty"`
-	AppliedSpec ClusterLoggingSpec `json:"appliedSpec,omitempty"`
+	Conditions  []LoggingCondition  `json:"conditions,omitempty"`
+	AppliedSpec ClusterLoggingSpec  `json:"appliedSpec,omitempty"`
+	FailedSpec  *ClusterLoggingSpec `json:"failedSpec,omitempty"`
 }
 
 type ProjectLoggingStatus struct {
@@ -93,17 +93,28 @@ type LoggingCondition struct {
 }
 
 type ElasticsearchConfig struct {
-	Endpoint     string `json:"endpoint,omitempty" norman:"required"`
-	IndexPrefix  string `json:"indexPrefix,omitempty" norman:"required"`
-	DateFormat   string `json:"dateFormat,omitempty" norman:"required,type=enum,options=YYYY-MM-DD|YYYY-MM|YYYY,default=YYYY-MM-DD"`
-	AuthUserName string `json:"authUsername,omitempty"` //secret
-	AuthPassword string `json:"authPassword,omitempty"` //secret
+	Endpoint      string `json:"endpoint,omitempty" norman:"required"`
+	IndexPrefix   string `json:"indexPrefix,omitempty" norman:"required"`
+	DateFormat    string `json:"dateFormat,omitempty" norman:"required,type=enum,options=YYYY-MM-DD|YYYY-MM|YYYY,default=YYYY-MM-DD"`
+	AuthUserName  string `json:"authUsername,omitempty"` //secret
+	AuthPassword  string `json:"authPassword,omitempty"` //secret
+	Certificate   string `json:"certificate,omitempty"`
+	ClientCert    string `json:"clientCert,omitempty"`
+	ClientKey     string `json:"clientKey,omitempty"`
+	ClientKeyPass string `json:"clientKeyPass,omitempty"`
+	SSLVerify     bool   `json:"sslVerify,omitempty"`
 }
 
 type SplunkConfig struct {
-	Endpoint string `json:"endpoint,omitempty" norman:"required"`
-	Source   string `json:"source,omitempty"`
-	Token    string `json:"token,omitempty" norman:"required"` //secret
+	Endpoint      string `json:"endpoint,omitempty" norman:"required"`
+	Source        string `json:"source,omitempty"`
+	Token         string `json:"token,omitempty" norman:"required"` //secret
+	Certificate   string `json:"certificate,omitempty"`
+	ClientCert    string `json:"clientCert,omitempty"`
+	ClientKey     string `json:"clientKey,omitempty"`
+	ClientKeyPass string `json:"clientKeyPass,omitempty"`
+	SSLVerify     bool   `json:"sslVerify,omitempty"`
+	Index         string `json:"index,omitempty"`
 }
 
 type EmbeddedConfig struct {
@@ -121,13 +132,21 @@ type KafkaConfig struct {
 	ZookeeperEndpoint string   `json:"zookeeperEndpoint,omitempty"`
 	BrokerEndpoints   []string `json:"brokerEndpoints,omitempty"`
 	Topic             string   `json:"topic,omitempty" norman:"required"`
+	Certificate       string   `json:"certificate,omitempty"`
+	ClientCert        string   `json:"clientCert,omitempty"`
+	ClientKey         string   `json:"clientKey,omitempty"`
 }
 
 type SyslogConfig struct {
-	Endpoint string `json:"endpoint,omitempty" norman:"required"`
-	Severity string `json:"severity,omitempty" norman:"default=notice,type=enum,options=emerg|alert|crit|err|warning|notice|info|debug"`
-	Program  string `json:"program,omitempty"`
-	Protocol string `json:"protocol,omitempty" norman:"default=udp,type=enum,options=udp|tcp"`
+	Endpoint    string `json:"endpoint,omitempty" norman:"required"`
+	Severity    string `json:"severity,omitempty" norman:"default=notice,type=enum,options=emerg|alert|crit|err|warning|notice|info|debug"`
+	Program     string `json:"program,omitempty"`
+	Protocol    string `json:"protocol,omitempty" norman:"default=udp,type=enum,options=udp|tcp"`
+	Token       string `json:"token,omitempty"`
+	Certificate string `json:"certificate,omitempty"`
+	ClientCert  string `json:"clientCert,omitempty"`
+	ClientKey   string `json:"clientKey,omitempty"`
+	SSLVerify   bool   `json:"sslVerify,omitempty"`
 }
 
 type LoggingSystemImages struct {
